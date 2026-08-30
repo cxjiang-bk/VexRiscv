@@ -32,13 +32,16 @@ case class DataCacheConfig(cacheSize : Int,
                            directTlbHit : Boolean = false,
                            mergeExecuteMemory : Boolean = false,
                            asyncTagMemory : Boolean = false,
-                           withWriteAggregation : Boolean = false){
+                           withWriteAggregation : Boolean = false,
+                           writeBack : Boolean = false){
 
   if(rfDataWidth == -1)  rfDataWidth = cpuDataWidth 
   assert(!(mergeExecuteMemory && (earlyDataMux || earlyWaysHits)))
   assert(!(earlyDataMux && !earlyWaysHits))
   assert(isPow2(pendingMax))
   assert(rfDataWidth <= memDataWidth)
+  require(!writeBack || wayCount == 1,
+    "DataCache write-back currently requires a direct-mapped cache")
 
   def lineCount = cacheSize/bytePerLine/wayCount
   def sizeMax = log2Up(bytePerLine)
@@ -247,6 +250,9 @@ case class DataCacheMemRsp(p : DataCacheConfig) extends Bundle{
   val error = Bool
   val exclusive = p.withExclusive generate Bool()
 }
+case class DataCacheMemWriteRsp() extends Bundle{
+  val error = Bool()
+}
 case class DataCacheInv(p : DataCacheConfig) extends Bundle{
   val enable = Bool()
   val address = UInt(p.addressWidth bit)
@@ -262,6 +268,7 @@ case class DataCacheSync(p : DataCacheConfig) extends Bundle{
 case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave{
   val cmd = Stream (DataCacheMemCmd(p))
   val rsp = Flow (DataCacheMemRsp(p))
+  val writeRsp = Flow (DataCacheMemWriteRsp())
 
   val inv = p.withInvalidate generate Stream(Fragment(DataCacheInv(p)))
   val ack = p.withInvalidate generate Stream(Fragment(DataCacheAck(p)))
@@ -270,6 +277,7 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
   override def asMaster(): Unit = {
     master(cmd)
     slave(rsp)
+    slave(writeRsp)
 
     if(p.withInvalidate) {
       slave(inv)
@@ -312,6 +320,9 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     rsp.error := !axi.r.isOKAY()
     rsp.data := axi.r.data
 
+    writeRsp.valid := axi.writeRsp.valid
+    writeRsp.error := !axi.writeRsp.isOKAY()
+
     axi.r.ready := True
     axi.b.ready := True
   }.axi
@@ -331,6 +342,8 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     rsp.valid := mm.readDataValid
     rsp.data  := mm.readData
     rsp.error := mm.response =/= AvalonMM.Response.OKAY
+    writeRsp.valid := False
+    writeRsp.error := False
 
     mm
   }
@@ -375,6 +388,8 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     rsp.valid := RegNext(cmdBridge.valid && !bus.WE && (bus.ACK || bus.ERR)) init(False)
     rsp.data  := RegNext(bus.DAT_MISO)
     rsp.error := RegNext(bus.ERR)
+    writeRsp.valid := RegNext(cmdBridge.valid && bus.WE && (bus.ACK || bus.ERR)) init(False)
+    writeRsp.error := RegNext(bus.ERR) init(False)
     bus
   }
 
@@ -396,6 +411,8 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     rsp.valid := bus.rsp.valid
     rsp.data  := bus.rsp.payload.data
     rsp.error := False
+    writeRsp.valid := False
+    writeRsp.error := False
     bus
   }
 
@@ -537,6 +554,13 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     rsp.error := bus.rsp.isError
     rsp.last := bus.rsp.last
     if(p.withExclusive) rsp.exclusive := bus.rsp.exclusive
+    if(!p.withWriteResponse) {
+      writeRsp.valid := bus.rsp.valid && bus.rsp.context(0)
+      writeRsp.error := bus.rsp.isError
+    } else {
+      writeRsp.valid := False
+      writeRsp.error := False
+    }
     bus.rsp.ready := True
 
     val invalidateLogic = p.withInvalidate generate new Area{
@@ -564,6 +588,14 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
 
 object DataCacheExternalAmoStates extends SpinalEnum{
   val LR_CMD, LR_RSP, SC_CMD, SC_RSP = newElement();
+}
+
+object DataCacheWriteBackState extends SpinalEnum{
+  val IDLE, READ_VICTIM, WAIT_VICTIM_READ, WRITE_VICTIM, WAIT_WRITE_RSP = newElement();
+}
+
+object DataCacheFlushState extends SpinalEnum{
+  val IDLE, READ_TAG, EVALUATE_TAG, WAIT_WRITE_BACK, WRITE_BACK_FAILED = newElement();
 }
 
 //If external amo, mem rsp should stay
@@ -600,7 +632,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
 
 
   class LineInfo() extends Bundle{
-    val valid, error = Bool()
+    val valid, error, dirty = Bool()
     val address = UInt(tagRange.length bit)
   }
 
@@ -615,12 +647,49 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
   val tagsWriteLastCmd = RegNext(tagsWriteCmd)
 
   val dataReadCmd =  Flow(UInt(log2Up(wayMemWordCount) bits))
+  val victimDataReadCmd = if(writeBack) Flow(UInt(log2Up(wayMemWordCount) bits)) else null
+  val flushTagReadCmd = if(writeBack) Flow(UInt(log2Up(wayLineCount) bits)) else null
   val dataWriteCmd = Flow(new Bundle{
     val way = Bits(wayCount bits)
     val address = UInt(log2Up(wayMemWordCount) bits)
     val data = Bits(memDataWidth bits)
     val mask = Bits(memDataWidth/8 bits)
   })
+
+  // The write-back path reads every word of a victim line through a dedicated
+  // synchronous RAM port, then commits one memory write after each read.
+  val writeBackState = if(writeBack) RegInit(DataCacheWriteBackState.IDLE) else null
+  val writeBackWay = if(writeBack) Reg(Bits(wayCount bits)) init(0) else null
+  val writeBackSet = if(writeBack) Reg(UInt(log2Up(wayLineCount) bits)) init(0) else null
+  val writeBackTag = if(writeBack) Reg(UInt(tagRange.length bits)) init(0) else null
+  val writeBackAddress = if(writeBack) Reg(UInt(addressWidth bits)) init(0) else null
+  val writeBackLine = if(writeBack) Reg(Bits(lineWidth bits)) init(0) else null
+  val writeBackReadCount = if(writeBack) Reg(UInt(log2Up(memWordPerLine max 2) bits)) init(0) else null
+  val writeBackWriteCount = if(writeBack) Reg(UInt(log2Up(memWordPerLine max 2) bits)) init(0) else null
+  val writeBackStart = if(writeBack) Bool() else null
+  val writeBackFromFlush = if(writeBack) Bool() else null
+  val writeBackFlushWay = if(writeBack) Bits(wayCount bits) else null
+  val writeBackFlushSet = if(writeBack) UInt(log2Up(wayLineCount) bits) else null
+  val writeBackFlushTag = if(writeBack) UInt(tagRange.length bits) else null
+  val writeBackBusy = if(writeBack) writeBackState =/= DataCacheWriteBackState.IDLE else False
+  val writeBackDone = if(writeBack) Bool() else null
+  val writeBackFailed = if(writeBack) Bool() else null
+  val writeBackHandled = if(writeBack) RegInit(False) else null
+  val writeBackInvalidate = if(writeBack) RegInit(False) else null
+  val writeBackError = if(writeBack) RegInit(False) else null
+  if(writeBack) {
+    writeBackStart := False
+    writeBackFromFlush := False
+    writeBackFlushWay.assignDontCare()
+    writeBackFlushSet.assignDontCare()
+    writeBackFlushTag.assignDontCare()
+    writeBackDone := False
+    writeBackFailed := False
+    when(!io.cpu.writeBack.isValid) {
+      writeBackHandled := False
+      writeBackError := False
+    }
+  }
 
 
   val ways = for(i <- 0 until wayCount) yield new Area{
@@ -635,6 +704,8 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     val dataReadRspMem = data.readSync(dataReadCmd.payload, dataReadCmd.valid && !io.cpu.memory.isStuck)
     val dataReadRspSel = if(mergeExecuteMemory) io.cpu.writeBack.address else io.cpu.memory.address
     val dataReadRsp = dataReadRspMem.subdivideIn(cpuDataWidth bits).read(dataReadRspSel(memWordToCpuWordRange))
+    val victimDataReadRsp = if(writeBack) data.readSync(victimDataReadCmd.payload, victimDataReadCmd.valid) else null
+    val flushTagReadRsp = if(writeBack) tags.readSync(flushTagReadCmd.payload, flushTagReadCmd.valid) else null
 
     val tagsInvReadRsp = withInvalidate generate(asyncTagMemory match {
       case false => tags.readSync(tagsInvReadCmd.payload, tagsInvReadCmd.valid)
@@ -659,6 +730,12 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
   tagsReadCmd.payload.assignDontCare()
   dataReadCmd.valid := False
   dataReadCmd.payload.assignDontCare()
+  if(writeBack) {
+    victimDataReadCmd.valid := False
+    victimDataReadCmd.payload.assignDontCare()
+    flushTagReadCmd.valid := False
+    flushTagReadCmd.payload.assignDontCare()
+  }
   tagsWriteCmd.valid := False
   tagsWriteCmd.payload.assignDontCare()
   dataWriteCmd.valid := False
@@ -829,6 +906,20 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     val mmuRsp = RegNextWhen(io.cpu.memory.mmuRsp, !io.cpu.writeBack.isStuck && !mmuRspFreeze)
     val tagsReadRsp = ways.map(w => ramPipe(w.tagsReadRsp))
     val dataReadRsp = !earlyDataMux generate ways.map(w => ramPipe(w.dataReadRsp))
+    // A store updates the tag RAM in the write-back stage. The next request can
+    // reach this stage before the synchronous tag read observes that update.
+    // Forward the registered tag write for dirty-victim selection so a
+    // back-to-back conflicting store cannot refill over the dirty line.
+    val writeBackVictimTags = if(writeBack) {
+      tagsReadRsp.zipWithIndex.map { case (tag, index) =>
+        val forwarded = CombInit(tag)
+        when(tagsWriteLastCmd.valid && tagsWriteLastCmd.way(index) &&
+             tagsWriteLastCmd.address === mmuRsp.physicalAddress(lineRange)) {
+          forwarded := tagsWriteLastCmd.data
+        }
+        forwarded
+      }
+    } else null
     val wayInvalidate = stagePipe(stageA. wayInvalidate)
     val consistancyHazard = if(stageA.consistancyCheck != null) stagePipe(stageA.consistancyCheck.hazard) else False
     val dataColisions = stagePipe(stageA.dataColisions)
@@ -847,37 +938,134 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
 
     io.cpu.writeBack.haltIt := True
 
-    //Evict the cache after reset logics
+    // Reset invalidates every line before fetch starts. A software cache flush
+    // uses the same scan, but drains dirty lines through the write-back engine
+    // before invalidating their tags.
     val flusher = new Area {
       val waitDone = RegInit(False) clearWhen(io.cpu.flush.ready)
       val hold = False
-      val counter = Reg(UInt(lineRange.size + 1 bits)) init(0)
-      when(!counter.msb) {
+      val bootCounter = Reg(UInt(lineRange.size + 1 bits)) init(0)
+      val ready = Bool()
+
+      ready := False
+      when(!bootCounter.msb) {
         tagsWriteCmd.valid := True
-        tagsWriteCmd.address := counter.resized
+        tagsWriteCmd.address := bootCounter.resized
         tagsWriteCmd.way.setAll()
         tagsWriteCmd.data.valid := False
+        tagsWriteCmd.data.dirty := False
         io.cpu.execute.haltIt := True
         when(!hold) {
-          counter := counter + 1
-          when(io.cpu.flush.valid && io.cpu.flush.singleLine){
-            counter.msb := True
+          bootCounter := bootCounter + 1
+        }
+      }
+
+      if(writeBack) {
+        import DataCacheFlushState._
+
+        val active = RegInit(False)
+        val state = RegInit(IDLE)
+        val line = Reg(UInt(log2Up(wayLineCount) bits)) init(0)
+        val singleLine = RegInit(False)
+        val victimWay = B(1, wayCount bits)
+        val victimSet = line
+        val victimTag = ways.head.flushTagReadRsp.address
+
+        def advance(): Unit = {
+          when(singleLine || line === U(wayLineCount - 1, log2Up(wayLineCount) bits)) {
+            active := False
+            state := IDLE
+          } otherwise {
+            line := line + 1
+            state := READ_TAG
           }
         }
-      }
 
-      io.cpu.flush.ready := waitDone && counter.msb
+        val canStart = bootCounter.msb && !active && !waitDone && io.cpu.flush.valid &&
+          !io.cpu.execute.isValid && !io.cpu.memory.isValid && !io.cpu.writeBack.isValid && !io.cpu.redo
+        when(canStart) {
+          active := True
+          waitDone := True
+          singleLine := io.cpu.flush.singleLine
+          line := io.cpu.flush.singleLine ? io.cpu.flush.lineId.resized | U(0, log2Up(wayLineCount) bits)
+          state := READ_TAG
+        }
 
-      val start = RegInit(True) //Used to relax timings
-      start := !waitDone && !start && io.cpu.flush.valid && !io.cpu.execute.isValid && !io.cpu.memory.isValid && !io.cpu.writeBack.isValid && !io.cpu.redo
+        when(active) {
+          io.cpu.execute.haltIt := True
+          when(!hold) {
+            switch(state) {
+              is(READ_TAG) {
+                flushTagReadCmd.valid := True
+                flushTagReadCmd.payload := line
+                state := EVALUATE_TAG
+              }
+              is(EVALUATE_TAG) {
+                when(ways.head.flushTagReadRsp.valid && ways.head.flushTagReadRsp.dirty) {
+                  writeBackStart := True
+                  writeBackFromFlush := True
+                  writeBackFlushWay := victimWay
+                  writeBackFlushSet := victimSet
+                  writeBackFlushTag := victimTag
+                  state := WAIT_WRITE_BACK
+                } otherwise {
+                  tagsWriteCmd.valid := True
+                  tagsWriteCmd.address := line
+                  tagsWriteCmd.way := victimWay
+                  tagsWriteCmd.data.valid := False
+                  tagsWriteCmd.data.dirty := False
+                  advance()
+                }
+              }
+              is(WAIT_WRITE_BACK) {
+                when(writeBackFailed) {
+                  state := WRITE_BACK_FAILED
+                } elsewhen(writeBackDone) {
+                  advance()
+                }
+              }
+              is(WRITE_BACK_FAILED) {
+                io.cpu.execute.haltIt := True
+              }
+            }
+          }
+        }
 
-      when(start){
-        waitDone := True
-        counter := 0
-        when(io.cpu.flush.valid && io.cpu.flush.singleLine){
-          counter := U"0" @@ io.cpu.flush.lineId
+        when(bootCounter.msb && waitDone && !active) {
+          ready := True
+        }
+      } else {
+        val active = RegInit(False)
+        val line = Reg(UInt(log2Up(wayLineCount) bits)) init(0)
+        val singleLine = RegInit(False)
+        val canStart = bootCounter.msb && !active && !waitDone && io.cpu.flush.valid &&
+          !io.cpu.execute.isValid && !io.cpu.memory.isValid && !io.cpu.writeBack.isValid && !io.cpu.redo
+        when(canStart) {
+          active := True
+          waitDone := True
+          singleLine := io.cpu.flush.singleLine
+          line := io.cpu.flush.singleLine ? io.cpu.flush.lineId.resized | U(0, log2Up(wayLineCount) bits)
+        }
+        when(active) {
+          tagsWriteCmd.valid := True
+          tagsWriteCmd.address := line
+          tagsWriteCmd.way.setAll()
+          tagsWriteCmd.data.valid := False
+          tagsWriteCmd.data.dirty := False
+          io.cpu.execute.haltIt := True
+          when(!hold) {
+            when(singleLine || line === U(wayLineCount - 1, log2Up(wayLineCount) bits)) {
+              active := False
+            } otherwise {
+              line := line + 1
+            }
+          }
+        }
+        when(bootCounter.msb && waitDone && !active) {
+          ready := True
         }
       }
+      io.cpu.flush.ready := ready
     }
 
     val lrSc = withInternalLrSc generate new Area{
@@ -934,6 +1122,15 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       dataWriteCmd.mask := 0
       dataWriteCmd.mask.subdivideIn(cpuDataWidth/8 bits).write(io.cpu.writeBack.address(memWordToCpuWordRange), mask)
       dataWriteCmd.way := waysHits
+      if(writeBack) when(request.wr && waysHit) {
+        tagsWriteCmd.valid := True
+        tagsWriteCmd.address := mmuRsp.physicalAddress(lineRange)
+        tagsWriteCmd.way := waysHits
+        tagsWriteCmd.data.valid := True
+        tagsWriteCmd.data.error := False
+        tagsWriteCmd.data.address := mmuRsp.physicalAddress(tagRange)
+        tagsWriteCmd.data.dirty := True
+      }
     }
 
     val badPermissions = (!mmuRsp.allowWrite && request.wr) || (!mmuRsp.allowRead && (!request.wr || isAmo))
@@ -1006,12 +1203,16 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
           io.cpu.writeBack.haltIt := False
         }
       } otherwise {
-        when(waysHit || request.wr && !isAmoCached) {   //Do not require a cache refill ?
+        when(waysHit || (if(!writeBack) request.wr && !isAmoCached else False)) {
           cpuWriteToCache := True
 
-          //Write through
-          io.mem.cmd.valid setWhen(request.wr)
-          io.cpu.writeBack.haltIt clearWhen(!request.wr || io.mem.cmd.ready)
+          if(writeBack) {
+            io.mem.cmd.valid := False
+            io.cpu.writeBack.haltIt := False
+          } else {
+            io.mem.cmd.valid setWhen(request.wr)
+            io.cpu.writeBack.haltIt clearWhen(!request.wr || io.mem.cmd.ready)
+          }
 
           if(withInternalAmo) when(isAmo){
             when(!amo.internal.resultRegValid) {
@@ -1032,14 +1233,26 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
             dataWriteCmd.valid := False
             io.cpu.writeBack.haltIt := False
           }
-        } otherwise { //Do refill
+        } otherwise { //Load miss and write-allocate store miss
+          if(writeBack) {
+            when(writeBackBusy) {
+              io.cpu.writeBack.haltIt := True
+            } otherwise {
+              val victimDirty = B(writeBackVictimTags.map(tag => tag.valid && tag.dirty)).orR
+              when(victimDirty && !writeBackHandled) {
+                writeBackStart := True
+                io.cpu.writeBack.haltIt := True
+              }
+            }
+          }
           //Emit cmd
-          io.mem.cmd.valid setWhen(!memCmdSent)
-          io.mem.cmd.wr := False
-          io.mem.cmd.address(0, lineRange.low bits) := 0
-          io.mem.cmd.size := log2Up(p.bytePerLine)
-
-          loaderValid setWhen(io.mem.cmd.ready)
+          when(!writeBackBusy && !(if(writeBack) writeBackStart else False)) {
+            io.mem.cmd.valid setWhen(!memCmdSent)
+            io.mem.cmd.wr := False
+            io.mem.cmd.address(0, lineRange.low bits) := 0
+            io.mem.cmd.size := log2Up(p.bytePerLine)
+            loaderValid setWhen(io.mem.cmd.fire)
+          }
         }
       }
     }
@@ -1050,7 +1263,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       if(catchAccessError) io.cpu.writeBack.accessError := !request.wr && isLast && io.mem.rsp.valid && io.mem.rsp.error
     } otherwise {
       io.cpu.writeBack.data := dataMux
-      if(catchAccessError) io.cpu.writeBack.accessError := (waysHits & B(tagsReadRsp.map(_.error))) =/= 0 || (loadStoreFault && !mmuRsp.isPaging)
+      if(catchAccessError) io.cpu.writeBack.accessError := (waysHits & B(tagsReadRsp.map(_.error))) =/= 0 || (loadStoreFault && !mmuRsp.isPaging) || (if(writeBack) writeBackError else False)
     }
 
     if(withLrSc) {
@@ -1084,6 +1297,91 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     assert(!(io.cpu.writeBack.isValid && !io.cpu.writeBack.haltIt && io.cpu.writeBack.isStuck), "writeBack stuck by another plugin is not allowed", ERROR)
   }
 
+  val writeBackEngine = if(writeBack) new Area {
+    import DataCacheWriteBackState._
+
+    // A refill starts only after a tag mismatch, so stageB.waysHits is zero at
+    // this point. The direct-mapped victim is selected from the stored tag
+    // metadata, not from the missed request's hit vector.
+    val victimWays = B(stageB.writeBackVictimTags.map(tag => tag.valid && tag.dirty))
+    val victimTag = MuxOH(victimWays, stageB.writeBackVictimTags.map(_.address))
+    val victimSet = stageB.mmuRsp.physicalAddress(lineRange)
+
+    when(writeBackStart && writeBackState === IDLE) {
+      writeBackState := READ_VICTIM
+      writeBackInvalidate := writeBackFromFlush
+      writeBackWay := writeBackFromFlush ? writeBackFlushWay | victimWays
+      writeBackSet := writeBackFromFlush ? writeBackFlushSet | victimSet
+      writeBackTag := writeBackFromFlush ? writeBackFlushTag | victimTag
+      writeBackAddress := (writeBackFromFlush ? writeBackFlushTag | victimTag) @@
+        (writeBackFromFlush ? writeBackFlushSet | victimSet) @@ U(0, log2Up(bytePerLine) bits)
+      writeBackReadCount := 0
+      writeBackWriteCount := 0
+      writeBackError := False
+    }
+
+    when(writeBackState === READ_VICTIM) {
+      victimDataReadCmd.valid := True
+      victimDataReadCmd.payload := (writeBackSet * memWordPerLine + writeBackReadCount).resized
+      when(victimDataReadCmd.fire) {
+        writeBackState := WAIT_VICTIM_READ
+      }
+    }
+
+    when(writeBackState === WAIT_VICTIM_READ) {
+      writeBackLine.subdivideIn(memDataWidth bits).write(
+        writeBackReadCount,
+        MuxOH(writeBackWay, ways.map(_.victimDataReadRsp)))
+      writeBackState := WRITE_VICTIM
+    }
+
+    when(writeBackState === WRITE_VICTIM) {
+      io.mem.cmd.valid := True
+      io.mem.cmd.wr := True
+      io.mem.cmd.uncached := False
+      io.mem.cmd.address := writeBackAddress + (writeBackWriteCount.resized << log2Up(bytePerMemWord))
+      io.mem.cmd.data := writeBackLine.subdivideIn(memDataWidth bits).read(writeBackWriteCount)
+      io.mem.cmd.mask.setAll()
+      io.mem.cmd.size := log2Up(bytePerMemWord)
+      io.mem.cmd.last := True
+      when(io.mem.cmd.fire) {
+        writeBackState := WAIT_WRITE_RSP
+      }
+    }
+
+    when(writeBackState === WAIT_WRITE_RSP && io.mem.writeRsp.valid) {
+      when(io.mem.writeRsp.error) {
+        writeBackError := True
+        writeBackFailed := True
+        when(!writeBackInvalidate) {
+          writeBackHandled := True
+        }
+        writeBackState := IDLE
+        memCmdSent := False
+      } otherwise {
+        when(writeBackWriteCount === memWordPerLine - 1) {
+          tagsWriteCmd.valid := True
+          tagsWriteCmd.address := writeBackSet
+          tagsWriteCmd.way := writeBackWay
+          tagsWriteCmd.data.valid := !writeBackInvalidate
+          tagsWriteCmd.data.error := False
+          tagsWriteCmd.data.dirty := False
+          tagsWriteCmd.data.address := writeBackTag
+          when(!writeBackInvalidate) {
+            writeBackHandled := True
+          }
+          writeBackDone := True
+          writeBackState := IDLE
+          memCmdSent := False
+        } otherwise {
+          writeBackReadCount := writeBackReadCount + 1
+          writeBackWriteCount := writeBackWriteCount + 1
+          writeBackState := READ_VICTIM
+        }
+      }
+    }
+  } else null
+
   val loader = new Area{
     val valid = RegInit(False) setWhen(stageB.loaderValid)
     val baseAddress =  stageB.mmuRsp.physicalAddress
@@ -1116,6 +1414,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       tagsWriteCmd.data.valid := !(kill || killReg)
       tagsWriteCmd.data.address := baseAddress(tagRange)
       tagsWriteCmd.data.error := error || (io.mem.rsp.valid && io.mem.rsp.error)
+      tagsWriteCmd.data.dirty := False
       tagsWriteCmd.way := waysAllocator
 
       error := False
@@ -1176,6 +1475,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
           stageB.flusher.hold := True
           tagsWriteCmd.address := input.address(lineRange)
           tagsWriteCmd.data.valid := False
+          tagsWriteCmd.data.dirty := False
           tagsWriteCmd.way := wayHits
           loader.done := False //Hold loader tags write
         }

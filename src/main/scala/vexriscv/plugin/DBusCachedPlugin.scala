@@ -332,6 +332,7 @@ class DBusCachedPlugin(val config : DataCacheConfig,
         rsp
       }
     })
+    cache.io.mem.writeRsp << dBus.writeRsp
 
     if(withInvalidate) {
       cache.io.mem.inv  << dBus.inv
