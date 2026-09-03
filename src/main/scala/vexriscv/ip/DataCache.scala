@@ -647,7 +647,6 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
   val tagsWriteLastCmd = RegNext(tagsWriteCmd)
 
   val dataReadCmd =  Flow(UInt(log2Up(wayMemWordCount) bits))
-  val victimDataReadCmd = if(writeBack) Flow(UInt(log2Up(wayMemWordCount) bits)) else null
   val flushTagReadCmd = if(writeBack) Flow(UInt(log2Up(wayLineCount) bits)) else null
   val dataWriteCmd = Flow(new Bundle{
     val way = Bits(wayCount bits)
@@ -656,8 +655,8 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     val mask = Bits(memDataWidth/8 bits)
   })
 
-  // The write-back path reads every word of a victim line through a dedicated
-  // synchronous RAM port, then commits one memory write after each read.
+  // CPU accesses are stalled during write-back, so victim reads time-share the
+  // normal data RAM read port and preserve a single-read/single-write memory.
   val writeBackState = if(writeBack) RegInit(DataCacheWriteBackState.IDLE) else null
   val writeBackWay = if(writeBack) Reg(Bits(wayCount bits)) init(0) else null
   val writeBackSet = if(writeBack) Reg(UInt(log2Up(wayLineCount) bits)) init(0) else null
@@ -701,10 +700,9 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       case false => tags.readSync(tagsReadCmd.payload, tagsReadCmd.valid && !io.cpu.memory.isStuck)
       case true => tags.readAsync(RegNextWhen(tagsReadCmd.payload, io.cpu.execute.isValid && !io.cpu.memory.isStuck))
     }
-    val dataReadRspMem = data.readSync(dataReadCmd.payload, dataReadCmd.valid && !io.cpu.memory.isStuck)
+    val dataReadRspMem = data.readSync(dataReadCmd.payload, dataReadCmd.valid)
     val dataReadRspSel = if(mergeExecuteMemory) io.cpu.writeBack.address else io.cpu.memory.address
     val dataReadRsp = dataReadRspMem.subdivideIn(cpuDataWidth bits).read(dataReadRspSel(memWordToCpuWordRange))
-    val victimDataReadRsp = if(writeBack) data.readSync(victimDataReadCmd.payload, victimDataReadCmd.valid) else null
     val flushTagReadRsp = if(writeBack) tags.readSync(flushTagReadCmd.payload, flushTagReadCmd.valid) else null
 
     val tagsInvReadRsp = withInvalidate generate(asyncTagMemory match {
@@ -731,8 +729,6 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
   dataReadCmd.valid := False
   dataReadCmd.payload.assignDontCare()
   if(writeBack) {
-    victimDataReadCmd.valid := False
-    victimDataReadCmd.payload.assignDontCare()
     flushTagReadCmd.valid := False
     flushTagReadCmd.payload.assignDontCare()
   }
@@ -1321,9 +1317,9 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     }
 
     when(writeBackState === READ_VICTIM) {
-      victimDataReadCmd.valid := True
-      victimDataReadCmd.payload := (writeBackSet * memWordPerLine + writeBackReadCount).resized
-      when(victimDataReadCmd.fire) {
+      dataReadCmd.valid := True
+      dataReadCmd.payload := (writeBackSet * memWordPerLine + writeBackReadCount).resized
+      when(dataReadCmd.fire) {
         writeBackState := WAIT_VICTIM_READ
       }
     }
@@ -1331,7 +1327,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     when(writeBackState === WAIT_VICTIM_READ) {
       writeBackLine.subdivideIn(memDataWidth bits).write(
         writeBackReadCount,
-        MuxOH(writeBackWay, ways.map(_.victimDataReadRsp)))
+        MuxOH(writeBackWay, ways.map(_.dataReadRspMem)))
       writeBackState := WRITE_VICTIM
     }
 
