@@ -65,7 +65,8 @@ case class DataCacheConfig(cacheSize : Int,
     useRegion = false,
     useBurst = false,
     useLock = false,
-    useQos = false
+    useQos = false,
+    useSize = true
   )
 
 
@@ -228,8 +229,10 @@ case class DataCacheMemCmd(p : DataCacheConfig) extends Bundle{
   val wr = Bool
   val uncached = Bool
   val address = UInt(p.addressWidth bit)
-  val data = Bits(p.cpuDataWidth bits)
-  val mask = Bits(p.cpuDataWidth/8 bits)
+  // The cache command is already expressed on the external memory bus.
+  // Narrow CPU accesses are lane-packed by DataCache before reaching here.
+  val data = Bits(p.memDataWidth bits)
+  val mask = Bits(p.memDataWidth/8 bits)
   val size   = UInt(p.sizeWidth bits) //... 1 => 2 bytes ... 2 => 4 bytes ...
   val exclusive = p.withExclusive generate Bool()
   val last = Bool
@@ -307,7 +310,9 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     axi.sharedCmd.write := cmdStage.wr
     axi.sharedCmd.prot := "010"
     axi.sharedCmd.cache := "1111"
-    axi.sharedCmd.size := log2Up(p.memDataBytes)
+    // Cacheline refill/writeback commands carry size=log2(line bytes), while
+    // uncached LB/LH/LW/SB/SH/SW preserve their CPU access size.
+    axi.sharedCmd.size := cmdStage.size.resized
     axi.sharedCmd.addr := cmdStage.address
     axi.sharedCmd.len  := cmdStage.beatCountMinusOne.resized
 
@@ -351,7 +356,7 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
   def toWishbone(): Wishbone = {
     val wishboneConfig = p.getWishboneConfig()
     val bus = Wishbone(wishboneConfig)
-    val counter = Reg(UInt(log2Up(p.burstSize) bits)) init(0)
+    val counter = Reg(UInt(log2Up(p.burstSize max 2) bits)) init(0)
     val addressShift = log2Up(p.memDataWidth/8)
 
     val cmdBridge = Stream (DataCacheMemCmd(p))
@@ -377,7 +382,7 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
     bus.ADR := cmdBridge.address >> addressShift
     bus.CTI := Mux(isBurst, cmdBridge.last ? B"111" | B"010", B"000")
     bus.BTE := B"00"
-    bus.SEL := cmdBridge.wr ? cmdBridge.mask | B((1 << p.memDataBytes)-1)
+    bus.SEL := cmdBridge.wr ? cmdBridge.mask | B((BigInt(1) << p.memDataBytes)-1, p.memDataBytes bits)
     bus.WE  := cmdBridge.wr
     bus.DAT_MOSI := cmdBridge.data
 
@@ -398,7 +403,7 @@ case class DataCacheMemBus(p : DataCacheConfig) extends Bundle with IMasterSlave
   def toPipelinedMemoryBus(): PipelinedMemoryBus = {
     val bus = PipelinedMemoryBus(32,32)
 
-    val counter = Reg(UInt(log2Up(p.burstSize) bits)) init(0)
+    val counter = Reg(UInt(log2Up(p.burstSize max 2) bits)) init(0)
     when(bus.cmd.fire){ counter := counter + 1 }
     when(    cmd.fire && cmd.last){ counter := 0 }
 
@@ -625,9 +630,11 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
   val tagRange = addressWidth-1 downto log2Up(wayLineCount*bytePerLine)
   val lineRange = tagRange.low-1 downto log2Up(bytePerLine)
   val cpuWordRange = log2Up(bytePerLine)-1 downto log2Up(bytePerWord)
-  val memWordRange = log2Up(bytePerLine)-1 downto log2Up(bytePerMemWord)
+  // With a native line-width memory beat there is no word sub-index. Keep
+  // the range anchored at the line index so 1-beat configurations elaborate.
+  val memWordRange = if(memWordPerLine == 1) lineRange else log2Up(bytePerLine)-1 downto log2Up(bytePerMemWord)
   val hitRange = tagRange.high downto lineRange.low
-  val memWordToCpuWordRange = log2Up(bytePerMemWord)-1 downto log2Up(bytePerWord)
+  val memWordToCpuWordRange = if(memDataWidth == cpuDataWidth) 0 downto 0 else log2Up(bytePerMemWord)-1 downto log2Up(bytePerWord)
   val cpuWordToRfWordRange = log2Up(bytePerWord)-1 downto log2Up(p.rfDataBytes)
 
 
@@ -702,7 +709,11 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     }
     val dataReadRspMem = data.readSync(dataReadCmd.payload, dataReadCmd.valid)
     val dataReadRspSel = if(mergeExecuteMemory) io.cpu.writeBack.address else io.cpu.memory.address
-    val dataReadRsp = dataReadRspMem.subdivideIn(cpuDataWidth bits).read(dataReadRspSel(memWordToCpuWordRange))
+    val dataReadRsp = if(memDataWidth == cpuDataWidth) {
+      dataReadRspMem
+    } else {
+      dataReadRspMem.subdivideIn(cpuDataWidth bits).read(dataReadRspSel(memWordToCpuWordRange))
+    }
     val flushTagReadRsp = if(writeBack) tags.readSync(flushTagReadCmd.payload, flushTagReadCmd.valid) else null
 
     val tagsInvReadRsp = withInvalidate generate(asyncTagMemory match {
@@ -930,7 +941,11 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     //Loader interface
     val loaderValid = False
 
-    val ioMemRspMuxed = io.mem.rsp.data.subdivideIn(cpuDataWidth bits).read(io.cpu.writeBack.address(memWordToCpuWordRange))
+    val ioMemRspMuxed = if(memDataWidth == cpuDataWidth) {
+      io.mem.rsp.data
+    } else {
+      io.mem.rsp.data.subdivideIn(cpuDataWidth bits).read(io.cpu.writeBack.address(memWordToCpuWordRange))
+    }
 
     io.cpu.writeBack.haltIt := True
 
@@ -1115,8 +1130,12 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       dataWriteCmd.valid setWhen(request.wr && waysHit)
       dataWriteCmd.address := mmuRsp.physicalAddress(lineRange.high downto memWordRange.low)
       dataWriteCmd.data.subdivideIn(cpuDataWidth bits).foreach(_ := requestDataBypass)
-      dataWriteCmd.mask := 0
-      dataWriteCmd.mask.subdivideIn(cpuDataWidth/8 bits).write(io.cpu.writeBack.address(memWordToCpuWordRange), mask)
+      if(memDataWidth == cpuDataWidth) {
+        dataWriteCmd.mask := mask
+      } else {
+        dataWriteCmd.mask := 0
+        dataWriteCmd.mask.subdivideIn(cpuDataWidth/8 bits).write(io.cpu.writeBack.address(memWordToCpuWordRange), mask)
+      }
       dataWriteCmd.way := waysHits
       if(writeBack) when(request.wr && waysHit) {
         tagsWriteCmd.valid := True
@@ -1143,8 +1162,18 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     io.mem.cmd.address := mmuRsp.physicalAddress
     io.mem.cmd.last := True
     io.mem.cmd.wr := request.wr
-    io.mem.cmd.mask := mask
-    io.mem.cmd.data := requestDataBypass
+    io.mem.cmd.mask := 0
+    io.mem.cmd.data := 0
+    if(memDataWidth == cpuDataWidth) {
+      io.mem.cmd.mask := mask
+      io.mem.cmd.data := requestDataBypass
+    } else {
+      // Uncached CPU accesses occupy the addressed 32-bit lane of the
+      // 512-bit AXI beat. Cached refill/writeback paths override these fields.
+      val lane = mmuRsp.physicalAddress(memWordToCpuWordRange)
+      io.mem.cmd.mask.subdivideIn(cpuDataWidth/8 bits).write(lane, mask)
+      io.mem.cmd.data.subdivideIn(cpuDataWidth bits).write(lane, requestDataBypass)
+    }
     io.mem.cmd.uncached := mmuRsp.isIoAccess
     io.mem.cmd.size := request.size.resized
     if(withExternalLrSc) io.mem.cmd.exclusive := request.isLrsc || isAmo
@@ -1325,9 +1354,13 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     }
 
     when(writeBackState === WAIT_VICTIM_READ) {
-      writeBackLine.subdivideIn(memDataWidth bits).write(
-        writeBackReadCount,
-        MuxOH(writeBackWay, ways.map(_.dataReadRspMem)))
+      if(memWordPerLine == 1) {
+        writeBackLine := MuxOH(writeBackWay, ways.map(_.dataReadRspMem))
+      } else {
+        writeBackLine.subdivideIn(memDataWidth bits).write(
+          writeBackReadCount,
+          MuxOH(writeBackWay, ways.map(_.dataReadRspMem)))
+      }
       writeBackState := WRITE_VICTIM
     }
 
@@ -1336,7 +1369,11 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       io.mem.cmd.wr := True
       io.mem.cmd.uncached := False
       io.mem.cmd.address := writeBackAddress + (writeBackWriteCount.resized << log2Up(bytePerMemWord))
-      io.mem.cmd.data := writeBackLine.subdivideIn(memDataWidth bits).read(writeBackWriteCount)
+      if(memWordPerLine == 1) {
+        io.mem.cmd.data := writeBackLine
+      } else {
+        io.mem.cmd.data := writeBackLine.subdivideIn(memDataWidth bits).read(writeBackWriteCount)
+      }
       io.mem.cmd.mask.setAll()
       io.mem.cmd.size := log2Up(bytePerMemWord)
       io.mem.cmd.last := True
@@ -1382,7 +1419,10 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
     val valid = RegInit(False) setWhen(stageB.loaderValid)
     val baseAddress =  stageB.mmuRsp.physicalAddress
 
-    val counter = Counter(memTransactionPerLine)
+    // Counter(1) would create a zero-width value in SpinalHDL. A one-bit
+    // implementation is used for the native single-beat line case, while
+    // completion is explicitly keyed off that response below.
+    val counter = Counter(memTransactionPerLine max 2)
     val waysAllocator = Reg(Bits(wayCount bits)) init(1)
     val error = RegInit(False)
     val kill = False
@@ -1390,7 +1430,7 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
 
     when(valid && io.mem.rsp.valid && rspLast){
       dataWriteCmd.valid := True
-      dataWriteCmd.address := baseAddress(lineRange) @@ counter
+      dataWriteCmd.address := (if(memTransactionPerLine == 1) baseAddress(lineRange) else baseAddress(lineRange) @@ counter)
       dataWriteCmd.data := io.mem.rsp.data
       dataWriteCmd.mask.setAll()
       dataWriteCmd.way := waysAllocator
@@ -1398,7 +1438,11 @@ class DataCache(val p : DataCacheConfig, mmuParameter : MemoryTranslatorBusParam
       counter.increment()
     }
 
-    val done = CombInit(counter.willOverflow)
+    val done = if(memTransactionPerLine == 1) {
+      CombInit(valid && io.mem.rsp.valid && rspLast)
+    } else {
+      CombInit(counter.willOverflow)
+    }
     if(withInvalidate) done setWhen(valid && pending.counter === 0) //Used to solve invalidate write request at the same time
 
     when(done){

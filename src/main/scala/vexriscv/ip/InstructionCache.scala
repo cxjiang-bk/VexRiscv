@@ -39,7 +39,7 @@ case class InstructionCacheConfig( cacheSize : Int,
     useRegion = false,
     useLock = false,
     useQos = false,
-    useSize = false
+    useSize = true
   )
 
   def getAvalonConfig() = AvalonMMConfig.bursted(
@@ -179,6 +179,7 @@ case class InstructionCacheMemBus(p : InstructionCacheConfig) extends Bundle wit
 
     mm.readCmd.valid := cmd.valid
     mm.readCmd.len := p.burstSize-1
+    mm.readCmd.size := cmd.size.resized
     mm.readCmd.addr := cmd.address
     mm.readCmd.prot  := "110"
     mm.readCmd.cache := "1111"
@@ -225,7 +226,7 @@ case class InstructionCacheMemBus(p : InstructionCacheConfig) extends Bundle wit
   def toWishbone(): Wishbone = {
     val wishboneConfig = p.getWishboneConfig()
     val bus = Wishbone(wishboneConfig)
-    val counter = Reg(UInt(log2Up(p.burstSize) bits)) init(0)
+    val counter = Reg(UInt(log2Up(p.burstSize max 2) bits)) init(0)
     val pending = counter =/= 0
     val lastCycle = counter === counter.maxValue
 
@@ -362,7 +363,9 @@ class InstructionCache(p : InstructionCacheConfig, mmuParameter : MemoryTranslat
     io.mem.cmd.size := log2Up(p.bytePerLine)
 
     val wayToAllocate = Counter(wayCount, !valid)
-    val wordIndex = KeepAttribute(Reg(UInt(log2Up(memWordPerLine) bits)) init(0))
+    // A 64-byte line on a 512-bit bus is a single beat. Keep one physical
+    // counter bit for elaboration, but do not append it to RAM addresses.
+    val wordIndex = KeepAttribute(Reg(UInt(log2Up(memWordPerLine max 2) bits)) init(0))
 
 
     val write = new Area{
@@ -383,14 +386,14 @@ class InstructionCache(p : InstructionCacheConfig, mmuParameter : MemoryTranslat
     for((writeBank, bankId) <- write.data.zipWithIndex){
       if(!reducedBankWidth) {
         writeBank.valid := io.mem.rsp.valid && wayToAllocate === bankId
-        writeBank.address := address(lineRange) @@ wordIndex
+        writeBank.address := (if(memWordPerLine == 1) address(lineRange) else address(lineRange) @@ wordIndex)
         writeBank.data := io.mem.rsp.data
       } else {
         val sel = U(bankId) - wayToAllocate.value
         val groupSel = wayToAllocate(log2Up(bankCount)-1 downto log2Up(bankCount/memToBankRatio))
         val subSel = sel(log2Up(bankCount/memToBankRatio) -1 downto 0)
         writeBank.valid := io.mem.rsp.valid && groupSel === (bankId >> log2Up(bankCount/memToBankRatio))
-        writeBank.address := address(lineRange) @@ wordIndex @@ (subSel)
+        writeBank.address := (if(memWordPerLine == 1) address(lineRange) @@ (subSel) else address(lineRange) @@ wordIndex @@ (subSel))
         writeBank.data := io.mem.rsp.data.subdivideIn(bankCount/memToBankRatio slices)(subSel)
       }
     }
@@ -485,4 +488,3 @@ class InstructionCache(p : InstructionCacheConfig, mmuParameter : MemoryTranslat
     io.cpu.decode.physicalAddress := mmuRsp.physicalAddress
   })
 }
-
